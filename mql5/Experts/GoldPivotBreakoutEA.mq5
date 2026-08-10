@@ -33,6 +33,7 @@
 #include <GoldTradePro/TradeState.mqh>
 #include <GoldTradePro/PendingManager.mqh>
 #include <GoldTradePro/ExitManager.mqh>
+#include <GoldTradePro/ZoneRecovery.mqh>
 
 //--- How the lot size is decided.
 enum ENUM_GTP_LOT_MODE
@@ -104,6 +105,24 @@ input double           InpCreepStep        = 10;         // Step per interval, p
 input int              InpCreepSeconds     = 300;        // Interval, seconds
 input double           InpCreepMinProfit   = 200;        // Only creep while profit exceeds this, points
 
+input group "=== Zone recovery (martingale - read the README) ==="
+input bool             InpUseZoneRecovery  = false;      // Enable zone recovery
+input double           InpZoneSize         = 800;        // Distance from entry to the far zone edge, points
+input double           InpZoneShrink       = 50;         // Zone narrows by this per level, points
+input double           InpZoneMinSize      = 300;        // Never narrower than this, points
+input ENUM_GTP_ZONE_VOLUME InpZoneVolMode  = GTP_ZONE_VOL_MULTIPLY; // Leg sizing
+input double           InpZoneFactor       = 1.6;        // Multiplier / fixed factor
+input int              InpZoneMaxLevels    = 5;          // Maximum recovery legs
+input ENUM_GTP_ZONE_MAXACTION InpZoneAtMax = GTP_ZONE_MAX_FREEZE; // Action at the level cap
+input double           InpZoneTargetMoney  = 50.0;       // Close the basket at this profit, account currency
+input bool             InpZoneUseMaxLoss   = true;       // Emergency close on basket loss
+input double           InpZoneMaxLossMoney = 500.0;      // Basket loss that triggers it
+input double           InpZoneMaxLot       = 1.0;        // Largest single recovery leg
+input double           InpZoneMaxTotalLots = 5.0;        // Largest total exposure per basket
+input double           InpZoneMinFreeMargin = 30.0;      // Stop adding legs below this free margin %
+input bool             InpZonePauseEntries = true;       // No new breakout orders while a basket is open
+input long             InpZoneMagicNumber  = 20260812;   // Magic for recovery legs
+
 input group "=== Guards ==="
 input double           InpMaxSpreadPoints  = 500;        // Park orders above this spread (0 = off)
 input double           InpMaxDailyLossPct  = 4.0;        // Halt for the day at this loss % (0 = off)
@@ -134,6 +153,7 @@ CPivotFinder      g_pivots;
 CTradeStateStore  g_states;
 CPendingManager   g_pendings;
 CExitManager      g_exits;
+CZoneRecovery     g_zone;
 
 int               g_digits    = 0;
 double            g_point     = 0.0;
@@ -208,6 +228,63 @@ int OnInit(void)
    g_exits.SetTimeTrail(InpUseTimeTrail, InpTimeTrailMinutes, Pts(InpTimeTrailDist));
    g_exits.SetCreep(InpUseCreepTrail, Pts(InpCreepStep), InpCreepSeconds, Pts(InpCreepMinProfit));
 
+   if(InpUseZoneRecovery)
+     {
+      if(InpZoneMagicNumber == InpMagicNumber)
+        {
+         Print("Gold Pivot: the zone recovery magic number must differ from the EA's");
+         return(INIT_PARAMETERS_INCORRECT);
+        }
+
+      if(InpZoneSize <= 0.0)
+        {
+         Print("Gold Pivot: zone recovery needs a zone size above zero");
+         return(INIT_PARAMETERS_INCORRECT);
+        }
+
+      if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)
+         != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+        {
+         Print("Gold Pivot: zone recovery requires a hedging account - "
+               "on netting, the opposite legs cancel out and no basket can exist");
+         return(INIT_FAILED);
+        }
+
+      g_zone.Configure(_Symbol, InpMagicNumber, InpZoneMagicNumber,
+                       GetPointer(g_trade), "ZR");
+      g_zone.SetZone(Pts(InpZoneSize), Pts(InpZoneShrink), Pts(InpZoneMinSize));
+      g_zone.SetVolume(InpZoneVolMode, InpZoneFactor, InpZoneMaxLot, InpZoneMaxTotalLots);
+      g_zone.SetLimits(InpZoneMaxLevels, InpZoneAtMax, InpZoneTargetMoney,
+                       InpZoneUseMaxLoss, InpZoneMaxLossMoney, InpZoneMinFreeMargin);
+
+      //--- Worst case if every level fills at the cap, so the number is on
+      //--- screen before the first basket rather than after it.
+      double base_ref = CalculateLots();
+      if(base_ref <= 0.0)
+         base_ref = InpFixedLots;
+
+      double worst = base_ref;
+      double total = base_ref;
+      for(int level = 1; level <= InpZoneMaxLevels; level++)
+        {
+         double leg = (InpZoneVolMode == GTP_ZONE_VOL_MULTIPLY)
+                      ? base_ref * MathPow(InpZoneFactor, level)
+                      : (InpZoneVolMode == GTP_ZONE_VOL_ADD
+                         ? base_ref * (level + 1)
+                         : base_ref * InpZoneFactor);
+         leg   = MathMin(leg, InpZoneMaxLot);
+         worst = MathMax(worst, leg);
+         total += leg;
+        }
+
+      PrintFormat("Gold Pivot: ZONE RECOVERY IS ON. From %.2f base lots, %d levels reach "
+                  "%.2f lots on the last leg and %.2f lots of total exposure "
+                  "(capped at %.2f). Basket loss limit %.2f %s.",
+                  base_ref, InpZoneMaxLevels, worst,
+                  MathMin(total, InpZoneMaxTotalLots), InpZoneMaxTotalLots,
+                  InpZoneMaxLossMoney, AccountInfoString(ACCOUNT_CURRENCY));
+     }
+
    g_states.Clear();
    g_last_bar  = 0;
    g_last_lots = 0.0;
@@ -233,9 +310,21 @@ void OnTick(void)
   {
    g_risk.Refresh();
 
+   //--- Positions inside an engaged basket are exempt from ordinary stop
+   //--- handling: their exit is the basket target, not a stop level.
+   if(InpUseZoneRecovery)
+     {
+      ulong owned_by_zone[];
+      g_zone.ActiveBaseTickets(owned_by_zone);
+      g_exits.SetExclusions(owned_by_zone);
+     }
+
    //--- Open positions are managed on every tick. A virtual stop that is
    //--- only checked once per bar is not a stop.
    g_exits.Manage();
+
+   if(InpUseZoneRecovery)
+      g_zone.Manage();
 
    if(InpShowPanel)
       UpdatePanel();
@@ -298,6 +387,14 @@ void OnTick(void)
    if(CountOwnPositions() >= InpMaxPositions)
      {
       g_status = "position limit reached";
+      return;
+     }
+
+   //--- A basket already carries more exposure than a normal trade would.
+   //--- Stacking fresh breakouts on top of it is how accounts disappear.
+   if(InpUseZoneRecovery && InpZonePauseEntries && g_zone.ActiveBasketCount() > 0)
+     {
+      g_status = "zone recovery in progress, entries paused";
       return;
      }
 
@@ -610,6 +707,21 @@ void UpdatePanel(void)
    string pivot_high = (g_pivot_high > 0.0 ? DoubleToString(g_pivot_high, g_digits) : "-");
    string pivot_low  = (g_pivot_low  > 0.0 ? DoubleToString(g_pivot_low,  g_digits) : "-");
 
+   string zone_line = "Zone        : off";
+   if(InpUseZoneRecovery)
+     {
+      int    levels = 0;
+      double worst  = 0.0;
+      double lots   = 0.0;
+      g_zone.Summary(levels, worst, lots);
+
+      if(levels == 0)
+         zone_line = "Zone        : armed, no basket open";
+      else
+         zone_line = StringFormat("Zone        : level %d/%d, %.2f lots, P/L %.2f (stop at -%.2f)",
+                                  levels, InpZoneMaxLevels, lots, worst, InpZoneMaxLossMoney);
+     }
+
    string text = StringFormat(
                     "Gold Pivot Breakout\n"
                     "Symbol      : %s (%d digits)\n"
@@ -622,6 +734,7 @@ void UpdatePanel(void)
                     "Positions   : %d / %d\n"
                     "Lot size    : %.2f\n"
                     "Stop mode   : %s\n"
+                    "%s\n"
                     "Day P/L     : %.2f%%\n"
                     "Drawdown    : %.2f%%\n"
                     "Equity      : %.2f %s",
@@ -634,6 +747,7 @@ void UpdatePanel(void)
                     CountOwnPositions(), InpMaxPositions,
                     g_last_lots,
                     stop_mode,
+                    zone_line,
                     -g_risk.DayLossPercent(),
                     g_risk.DrawdownPercent(),
                     AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY));

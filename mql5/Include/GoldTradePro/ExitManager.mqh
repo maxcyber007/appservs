@@ -72,6 +72,18 @@ private:
    double             m_partial_percent;
    double             m_partial_trigger;
 
+   //--- Positions handed over to another module (zone recovery) that owns
+   //--- their exit. Their stops must not be touched or checked here.
+   ulong              m_excluded[];
+
+   bool               IsExcluded(const ulong ticket) const
+     {
+      for(int i = ArraySize(m_excluded) - 1; i >= 0; i--)
+         if(m_excluded[i] == ticket)
+            return(true);
+      return(false);
+     }
+
    //--- Register a position the EA has not seen before.
    void               Register(const ulong ticket)
      {
@@ -212,6 +224,17 @@ public:
    void               SetPartial(const bool use, const double percent, const double trigger)
      { m_use_partial = use; m_partial_percent = percent; m_partial_trigger = trigger; }
 
+   //--- Replace the exclusion list. Pass an empty array to manage everything.
+   void               SetExclusions(const ulong &tickets[])
+     {
+      int count = ArraySize(tickets);
+      ArrayResize(m_excluded, count);
+      for(int i = 0; i < count; i++)
+         m_excluded[i] = tickets[i];
+     }
+
+   void               ClearExclusions(void) { ArrayResize(m_excluded, 0); }
+
    ENUM_GTP_STOP_MODE StopMode(void) const { return(m_stop_mode); }
    double             ProtectMultiplier(void) const { return(m_protect_mult); }
 
@@ -238,6 +261,10 @@ public:
             continue;
 
          ulong ticket = m_position.Ticket();
+
+         //--- Owned by zone recovery: its basket target is the exit now.
+         if(IsExcluded(ticket))
+            continue;
 
          SGoldTradeState state;
          if(!m_states.Get(ticket, state))

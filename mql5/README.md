@@ -337,3 +337,93 @@ Start with `InpStopLossPoints`, `InpTrailDistance` and `InpMinPivotDistance`;
 `InpLeftBars` / `InpRightBars` change what counts as a pivot at all, so treat
 them as a separate coarse pass rather than mixing them into the same
 optimisation.
+
+## Zone recovery (optional, off by default)
+
+`InpUseZoneRecovery` turns on a hedged martingale. Read this section before
+enabling it — it changes what the rest of the EA's risk controls mean.
+
+### What it does
+
+When a base position moves against the EA, instead of taking the loss it opens a
+larger position the other way at the far edge of a price zone, and flips again
+each time price crosses the zone, each leg larger than the last:
+
+```
+base BUY at E                      upper edge = E
+                                   lower edge = E − ZoneSize
+
+price falls to the lower edge  →   SELL, larger
+price returns to E             →   BUY,  larger still
+price falls to the lower edge  →   SELL, larger still
+...
+```
+
+Whichever way price finally breaks out, the newest and largest leg drags the
+basket to `InpZoneTargetMoney` and everything closes together. The zone narrows
+by `InpZoneShrink` per level (floored at `InpZoneMinSize`), so each recovery
+needs a smaller move than the one before.
+
+### What it costs
+
+**It converts a small certain loss into a large uncertain one.** Exposure grows
+geometrically while price stays in the zone. The strategy wins repeatedly and
+fails once — when price runs far enough in one direction that the account cannot
+fund the next leg. A backtest of a martingale looks excellent right up to the bar
+where it doesn't, so judge it by the depth it reached, not by the equity curve.
+
+**Engaging a basket removes the stop loss from the base position.** A stop firing
+mid-recovery would close the hedged leg and leave the rest of the basket naked,
+so the EA clears the base position's stop and target when the first recovery leg
+opens, and logs that it did. The position is then exempt from all four trailing
+rules. From that point the basket's only risk controls are:
+
+| Control | Input |
+| --- | --- |
+| Basket loss limit | `InpZoneMaxLossMoney` (with `InpZoneUseMaxLoss`) |
+| Level cap | `InpZoneMaxLevels` and `InpZoneAtMax` |
+| Largest single leg | `InpZoneMaxLot` |
+| Largest total exposure | `InpZoneMaxTotalLots` |
+| Free margin floor | `InpZoneMinFreeMargin` |
+
+**The daily loss limit no longer bounds your day.** `InpMaxDailyLossPct` blocks
+new *breakout* orders, but recovery legs are deliberately exempt — halting a
+half-built basket would strand hedged exposure with nothing managing it. If you
+need a hard daily ceiling, `InpZoneMaxLossMoney` is the input that provides it.
+
+At the level cap, `InpZoneAtMax` decides between `FREEZE` (add nothing more, let
+the basket run to its target or its loss limit) and `CLOSE` (take the loss
+immediately). `FREEZE` keeps the recovery alive; `CLOSE` is the one that
+guarantees the loss stays bounded by the level cap rather than by price.
+
+### Sizing, concretely
+
+With `GTP_ZONE_VOL_MULTIPLY` and factor *f*, leg *n* is `base × f^n`, so total
+exposure after *L* levels is roughly `base × (f^(L+1) − 1) / (f − 1)`:
+
+| Factor | 5 levels, from 0.01 base | Last leg | Total |
+| --- | --- | --- | --- |
+| 1.5 | 0.01 → 0.08 | 0.08 | 0.24 |
+| 1.6 | 0.01 → 0.10 | 0.10 | 0.29 |
+| 2.0 | 0.01 → 0.32 | 0.32 | 0.63 |
+
+The EA prints your own numbers to the Experts log at startup, including where the
+caps bite. Read that line before letting it trade — if the projected total is
+larger than you would ever open by hand, lower the factor or the level cap.
+
+`GTP_ZONE_VOL_ADD` grows linearly (`base × (n+1)`) and is far gentler; it
+recovers more slowly and needs a bigger breakout to reach the target.
+
+### Requirements and caveats
+
+- **Hedging account required.** The EA refuses to initialise on netting, where
+  opposite legs cancel out and no basket can exist.
+- **Recovery legs are tracked through the order comment** (`ZR<baseTicket>`).
+  A broker that rewrites or truncates comments will break the link between a
+  basket and its legs. Check on demo that the comments survive — the EA closes
+  legs it cannot match to a live base position as orphans.
+- **Set `InpZoneSize` below `InpStopLossPoints`** if you want recovery to engage
+  at all; otherwise the ordinary stop fires first and the basket never starts.
+  Leaving the stop closer than the zone is a legitimate, safer configuration.
+- **Test with `InpZonePauseEntries` on** (the default). It stops the EA stacking
+  fresh breakout trades on top of an open basket.
