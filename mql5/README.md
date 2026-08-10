@@ -1,4 +1,19 @@
-# Gold Trade Pro EA
+# Gold EAs for MetaTrader 5
+
+Two independent Expert Advisors for gold (XAUUSD) share the helper library in
+`Include/GoldTradePro/`:
+
+| EA | Approach |
+| --- | --- |
+| `GoldTradeProEA.mq5` | Trend following — EMA cross entries at market, ATR stops |
+| `GoldPivotBreakoutEA.mq5` | Pivot breakout — stop orders resting at swing levels, virtual stops, layered trailing |
+
+Both are documented below. Install whichever you want; the include folder is the
+same for both.
+
+---
+
+# Gold Trade Pro EA (trend following)
 
 A trend-following MetaTrader 5 Expert Advisor built for gold (XAUUSD). It takes
 EMA-cross entries in the direction of a higher-timeframe bias, sizes every trade
@@ -177,3 +192,148 @@ Use **View → Strategy Tester** with:
 When optimising, treat `InpAtrSlMultiplier`, `InpAtrTpMultiplier` and the RSI
 bands as the primary parameters, and keep the risk percentage fixed so results
 stay comparable.
+
+---
+
+# Gold Pivot Breakout EA
+
+A breakout EA of a different shape: instead of entering at market when an
+indicator turns, it leaves stop orders resting just beyond the nearest confirmed
+swing high and swing low, and is filled only if price actually breaks the level.
+Exits run through a stack of stop-tightening rules, and the working stop can be
+kept EA-side so the broker never sees it.
+
+> **Risk notice.** The defaults are neutral starting points, not tuned values,
+> and have not been backtested against any data. Optimise for your own broker
+> and forward test on demo first.
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `Experts/GoldPivotBreakoutEA.mq5` | The EA: inputs, order placement, filters, panel |
+| `Include/GoldTradePro/PivotFinder.mqh` | Swing high / low detection |
+| `Include/GoldTradePro/PendingManager.mqh` | Stop-order placement, capping, expiry, spread parking |
+| `Include/GoldTradePro/ExitManager.mqh` | Virtual stops, break-even, partial close, four trailing rules |
+| `Include/GoldTradePro/TradeState.mqh` | Per-position bookkeeping MetaTrader does not keep |
+| `Include/GoldTradePro/RiskManager.mqh` | Lot sizing and account guards (shared) |
+| `Include/GoldTradePro/Utils.mqh` | Symbol maths (shared) |
+
+Install exactly as above, compiling `GoldPivotBreakoutEA.mq5` instead.
+
+## Everything is in points
+
+Every distance input is in **points of the symbol**, never pips or dollars.
+Broker gold feeds differ — a 2-digit and a 3-digit XAUUSD quote report the same
+move as a tenfold different point count — so no default here can be right for
+your broker. Put the EA on a chart, read the panel's live **Spread** and
+**Pivot high / low** values, and set the inputs from those numbers.
+
+## How a level becomes an order
+
+On each bar of the entry timeframe the EA looks for the nearest swing point that
+price has not yet reached. A bar at index *i* qualifies as a swing high when:
+
+1. no bar in the `InpRightBars` newer than it has a higher high — the swing is
+   confirmed, price turned away from it;
+2. no bar in the `InpLeftBars` older than it has a higher high — it is a real
+   local extreme, not a step inside a rally;
+3. with `InpRequireExtreme`, nothing newer has exceeded it — so it is the first
+   level an upward breakout will meet;
+4. it sits at least `InpMinPivotDistance` above the current Ask.
+
+A buy stop then goes `InpBuyOffset` above it, mirrored for the sell side. The
+order is skipped when one already rests within `InpMinOrderSpacing` of the same
+price, or when the per-side cap is full. If the cap is exceeded, the *worst*
+order is dropped — the buy stop furthest above price, the sell stop furthest
+below — since that is the one least likely to fill on a real move.
+
+## Where the stop lives
+
+`InpStopMode` picks one of three arrangements:
+
+| Mode | Server sees | EA manages | Use when |
+| --- | --- | --- | --- |
+| `GTP_STOPS_BROKER` | The real stop | Moves it via `PositionModify` | You want protection that survives the EA being shut down |
+| `GTP_STOPS_VIRTUAL` | Nothing | Closes at market when the level is crossed | You do not want the stop visible on the server |
+| `GTP_STOPS_PROTECTED` | A wider safety net | The tight stop, EA-side | Default — hidden stop, but a disconnect cannot leave the position naked |
+
+In protected mode the safety net sits `InpProtectMultiple` × the stop distance
+away and trails behind the virtual stop, so it is always the outer of the two.
+
+**A virtual stop only works while the EA is running.** If the terminal is
+closed, the VPS drops, or the chart is removed, nothing is watching the level.
+That is the trade-off you accept for hiding it, and it is why the default is
+protected rather than fully virtual.
+
+## The four trailing rules
+
+Each runs independently on every tick and proposes a stop level; the most
+protective proposal wins, and the stop never moves backwards.
+
+| Rule | Trigger | Effect |
+| --- | --- | --- |
+| Time trail | Position older than `InpTimeTrailMinutes` and onside | Trails at `InpTimeTrailDist` — tightens the leash on trades that stalled |
+| Profit trail | Profit ≥ `InpTrailStart` | Trails at `InpTrailDistance`, optionally stopping once the stop is `InpTrailCap` past entry |
+| Break-even | Profit ≥ `InpBreakEvenStart` | Stop to entry + `InpBreakEvenLock` |
+| Creep trail | Profit ≥ `InpCreepMinProfit`, every `InpCreepSeconds` | Moves the stop `InpCreepStep` closer — grinds risk down on slow drifts the profit trail never arms on |
+
+The partial close fires once at `InpPartialTrigger`, closing `InpPartialPercent`
+of the volume, and is skipped when either part would fall below the broker's
+minimum lot.
+
+## Order housekeeping
+
+- **Spread parking** — above `InpMaxSpreadPoints` every resting order is pulled
+  off the book and remembered, then restored when the spread normalises. Gold
+  spreads blow out at rollover and on news; a resting stop order in that window
+  fills at a price nobody would accept.
+- **Virtual expiry** — orders older than `InpExpiryHours` are deleted by the EA
+  itself rather than with `ORDER_TIME_SPECIFIED`, because a fair number of
+  brokers reject or ignore broker-side expiry.
+- **Volume refresh** — when the balance moves enough that the target lot has
+  drifted by `InpVolumeRefreshPct`, resting orders are re-issued at the new size,
+  so an old order cannot fire at a stale volume.
+
+## Lot sizing
+
+| Mode | Formula |
+| --- | --- |
+| `GTP_LOT_FIXED` | `InpFixedLots` |
+| `GTP_LOT_RISK_PERCENT` | Balance × `InpRiskPercent` / 100, divided by the loss-per-lot over `InpStopLossPoints` |
+| `GTP_LOT_BALANCE_STEP` | One volume step per `InpBalancePerStep` of balance |
+
+All three are clamped to `InpMaxLots`, snapped to the broker's lot step, and
+checked against free margin. In risk-percent mode, if even the minimum lot would
+risk more than 1.5× the budget, the trade is skipped rather than taken oversized.
+
+## Filters
+
+| Filter | Input | Behaviour |
+| --- | --- | --- |
+| Session | `InpSessionStartHour` / `InpSessionEndHour` | Server time; equal values mean 24h |
+| Rollover | `InpDaySwitchPause` | No new orders in the minutes around midnight, where quotes are thin and spreads widen |
+| Weekend | `InpFlatBeforeWeekend`, `InpFridayCutoffHour` | Deletes resting orders late Friday so nothing survives into the gap |
+| News | `InpSkipNfpWindow`, `InpNfpStartHour` / `InpNfpEndHour` | Skips the first Friday of the month during the payroll window |
+| Daily loss | `InpMaxDailyLossPct` | Halts new orders for the rest of the server day |
+| Drawdown | `InpMaxDrawdownPct` | Halts new orders while equity is this far below its peak |
+
+Guards block *opening*. They never close an existing position — exits stay with
+the stop, target and trailing rules.
+
+## Account type
+
+The EA places orders on both sides at once and can hold more than one position,
+so it expects a **hedging** account. On a netting account opposite fills offset
+each other and the per-position bookkeeping will not match what the terminal
+shows; set `InpSide` to one direction and `InpMaxPositions` to 1 if you must run
+it there.
+
+## Backtesting
+
+Use "Every tick based on real ticks" — virtual stops, the creep trail and the
+partial close all act intrabar, and M1-OHLC modelling will not reproduce them.
+Start with `InpStopLossPoints`, `InpTrailDistance` and `InpMinPivotDistance`;
+`InpLeftBars` / `InpRightBars` change what counts as a pivot at all, so treat
+them as a separate coarse pass rather than mixing them into the same
+optimisation.

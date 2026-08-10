@@ -163,5 +163,20 @@ public:
 
       return(lots);
      }
+
+   //--- "One lot step per N units of balance" sizing: the account grows into
+   //--- larger positions without the stop distance entering the calculation.
+   double            LotsPerBalanceStep(const double balance_per_step)
+     {
+      if(balance_per_step <= 0.0)
+         return(0.0);
+
+      double base = AccountInfoDouble(ACCOUNT_BALANCE);
+      double step = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
+      if(step <= 0.0)
+         step = 0.01;
+
+      return(GTP_NormalizeLots(m_symbol, MathFloor(base / balance_per_step) * step));
+     }
   };
 //+------------------------------------------------------------------+
